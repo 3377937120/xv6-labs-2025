@@ -61,5 +61,37 @@ void
 memdump(char *fmt, char *data)
 {
   // Your code here.
-
+  for(; *fmt; fmt++){
+  switch(*fmt){
+  case 'i':
+    printf("%d\n", *(int*)data);
+    data += sizeof(int);
+    break;
+  case 'p':
+    printf("%llx\n", *(long long*)data);
+    data += sizeof(long long);
+    break;
+  case 'h':
+    printf("%d\n", *(ushort*)data);
+    data += sizeof(ushort);
+    break;
+  case 'c':
+    printf("%c\n", *(uchar*)data);
+    data += sizeof(uchar);
+    break;
+  case 's': {
+    char *s = *(char**)data;
+    printf("%s\n", s);
+    data += sizeof(char*);
+    break;
+  }
+  case 'S':
+    printf("%s\n", data);
+    data += strlen(data) + 1;
+    break;
+  default:
+    fprintf(2, "memdump: bad format %c\n", *fmt);
+    return;
+  }
+}
 }
