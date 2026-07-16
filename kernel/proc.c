@@ -125,6 +125,9 @@ found:
   p->pid = allocpid();
   p->state = USED;
 
+  p->syscall_mask = 0;
+  safestrcpy(p->allowed_path, "-", sizeof(p->allowed_path));
+
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
@@ -286,6 +289,12 @@ kfork(void)
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
+
+  // Inherit the parent's sandbox restrictions.
+  np->syscall_mask = p->syscall_mask;
+  safestrcpy(np->allowed_path,
+             p->allowed_path,
+             sizeof(np->allowed_path));
 
   pid = np->pid;
 

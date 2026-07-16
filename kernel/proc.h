@@ -92,6 +92,10 @@ struct proc {
   int xstate;                  // Exit status to be returned to parent's wait
   int pid;                     // Process ID
 
+  // Sandbox state.
+  uint64 syscall_mask;         // 一个 64 位位图，用来保存该进程被禁止的系统调用
+  char allowed_path[MAXPATH];  // 表示允许访问的路径，默认值为 "-"，表示允许访问所有路径
+
   // wait_lock must be held when using this:
   struct proc *parent;         // Parent process
 

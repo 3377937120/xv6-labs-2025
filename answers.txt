@@ -1,0 +1,8 @@
+Lab System calls 问题答案
+
+1. 在 GDB 中停在 syscall() 时，当前调用来自 usertrap()；用户程序通过 ecall 进入内核。
+2. 寄存器 a7 保存系统调用号。执行 open 时 a7=15。
+3. sstatus 的 SPP 位为 0，表示陷阱前 CPU 处于用户态。
+4. 将 num=*(int*)0 后触发的指令是对地址 0 的lw a3,0(zero) # 0 <_entry-0x80000000>，num对应寄存器即a3。
+5. 因为物理地址0是Unused，所以lw a3,0(zero) 无法解析该地址。scause=0xd，Load page fault
+6. 发生该故障时通常是 init 进程，pid=1。可在 GDB 中用 p p->pid 验证。

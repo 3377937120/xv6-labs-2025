@@ -101,6 +101,7 @@ extern uint64 sys_unlink(void);
 extern uint64 sys_link(void);
 extern uint64 sys_mkdir(void);
 extern uint64 sys_close(void);
+extern uint64 sys_interpose(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -126,7 +127,31 @@ static uint64 (*syscalls[])(void) = {
 [SYS_link]    sys_link,
 [SYS_mkdir]   sys_mkdir,
 [SYS_close]   sys_close,
+[SYS_interpose] sys_interpose,
 };
+
+static int
+interpose_allows(struct proc *p, int num)
+{
+  char path[MAXPATH];
+
+  // 对应位没有被设置，说明该系统调用没有被禁止。
+  if((p->syscall_mask & (1ULL << num)) == 0)
+    return 1;
+
+  // open 和 exec 的第一个参数都是路径字符串。
+  // 当 allowed_path 不是 "-"，并且实际路径与允许路径相同时，
+  // 即使该系统调用被 mask 屏蔽，也允许执行。
+  if((num == SYS_open || num == SYS_exec) &&
+     strncmp(p->allowed_path, "-", MAXPATH) != 0) {
+    if(fetchstr(p->trapframe->a0, path, sizeof(path)) >= 0 &&
+       strncmp(path, p->allowed_path, MAXPATH) == 0)
+      return 1;
+  }
+
+  // 系统调用被 mask 禁止，并且不符合路径例外条件。
+  return 0;
+}
 
 void
 syscall(void)
@@ -138,6 +163,10 @@ syscall(void)
   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
     // Use num to lookup the system call function for num, call it,
     // and store its return value in p->trapframe->a0
+    if(!interpose_allows(p, num)){
+    p->trapframe->a0 = -1;
+    return;
+    }
     p->trapframe->a0 = syscalls[num]();
   } else {
     printf("%d %s: unknown sys call %d\n",
