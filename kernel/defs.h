@@ -1,7 +1,3 @@
-#ifdef LAB_MMAP
-gtypedef unsigned long size_t;
-typedef long int off_t;
-#endif
 struct buf;
 struct context;
 struct file;
@@ -12,49 +8,46 @@ struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
-#ifdef LAB_LOCK
-struct rwspinlock;
-#endif
 
 // bio.c
-void            binit(void);
-struct buf*     bread(uint, uint);
-void            brelse(struct buf*);
-void            bwrite(struct buf*);
-void            bpin(struct buf*);
-void            bunpin(struct buf*);
+void             binit(void);
+struct buf*      bread(uint, uint);
+void             brelse(struct buf*);
+void             bwrite(struct buf*);
+void             bpin(struct buf*);
+void             bunpin(struct buf*);
 
 // console.c
-void            consoleinit(void);
-void            consoleintr(int);
-void            consputc(int);
+void             consoleinit(void);
+void             consoleintr(int);
+void             consputc(int);
 
 // exec.c
-int             kexec(char*, char**);
+int              kexec(char*, char**);
 
 // file.c
-struct file*    filealloc(void);
-void            fileclose(struct file*);
-struct file*    filedup(struct file*);
-void            fileinit(void);
-int             fileread(struct file*, uint64, int n);
-int             filestat(struct file*, uint64 addr);
-int             filewrite(struct file*, uint64, int n);
+struct file*     filealloc(void);
+void             fileclose(struct file*);
+struct file*     filedup(struct file*);
+void             fileinit(void);
+int              fileread(struct file*, uint64, int n);
+int              filestat(struct file*, uint64 addr);
+int              filewrite(struct file*, uint64, int n);
 
 // fs.c
-void            fsinit(int);
-int             dirlink(struct inode*, char*, uint);
-struct inode*   dirlookup(struct inode*, char*, uint*);
-struct inode*   ialloc(uint, short);
-struct inode*   idup(struct inode*);
-void            iinit();
-void            ilock(struct inode*);
-void            iput(struct inode*);
-void            iunlock(struct inode*);
-void            iunlockput(struct inode*);
-void            iupdate(struct inode*);
-int             namecmp(const char*, const char*);
-struct inode*   namei(char*);
+void             fsinit(int);
+int              dirlink(struct inode*, char*, uint);
+struct inode* dirlookup(struct inode*, char*, uint*);
+struct inode* ialloc(uint, short);
+struct inode* idup(struct inode*);
+void             iinit();
+void             ilock(struct inode*);
+void             iput(struct inode*);
+void             iunlock(struct inode*);
+void             iunlockput(struct inode*);
+void             iupdate(struct inode*);
+int              namecmp(const char*, const char*);
+struct inode* namei(char*);
 struct inode*   nameiparent(char*, char*);
 int             readi(struct inode*, int, uint64, uint, uint);
 void            stati(struct inode*, struct stat*);
@@ -66,6 +59,8 @@ void            ireclaim(int);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
+void*           superalloc(void);
+void            superfree(void *);
 
 // log.c
 void            initlog(int, struct superblock*);
@@ -119,15 +114,6 @@ void            initlock(struct spinlock*, char*);
 void            release(struct spinlock*);
 void            push_off(void);
 void            pop_off(void);
-int             atomic_read4(int *addr);
-#ifdef LAB_LOCK
-void            freelock(struct spinlock*);
-void            read_acquire(struct rwspinlock*);
-void            read_release(struct rwspinlock*);
-void            write_acquire(struct rwspinlock*);
-void            write_release(struct rwspinlock*);
-void            rwspinlock_test();
-#endif
 
 // sleeplock.c
 void            acquiresleep(struct sleeplock*);
@@ -164,80 +150,57 @@ void            uartinit(void);
 void            uartintr(void);
 void            uartwrite(char [], int);
 void            uartputc_sync(int);
-int             uartgetc(void);
+int              uartgetc(void);
 
 // vm.c
-void            kvminit(void);
-void            kvminithart(void);
-void            kvmmap(pagetable_t, uint64, uint64, uint64, int);
-int             mappages(pagetable_t, uint64, uint64, uint64, int);
-pagetable_t     uvmcreate(void);
-uint64          uvmalloc(pagetable_t, uint64, uint64, int);
-uint64          uvmdealloc(pagetable_t, uint64, uint64);
-int             uvmcopy(pagetable_t, pagetable_t, uint64);
-void            uvmfree(pagetable_t, uint64);
-void            uvmunmap(pagetable_t, uint64, uint64, int);
-void            uvmclear(pagetable_t, uint64);
-pte_t *         walk(pagetable_t, uint64, int);
-uint64          walkaddr(pagetable_t, uint64);
-int             copyout(pagetable_t, uint64, char *, uint64);
-int             copyin(pagetable_t, char *, uint64, uint64);
-int             copyinstr(pagetable_t, char *, uint64, uint64);
-int             ismapped(pagetable_t, uint64);
-uint64          vmfault(pagetable_t, uint64, int);
-#if defined(LAB_PGTBL) || defined(SOL_MMAP)
-void            vmprint(pagetable_t);
-#endif
+void             kvminit(void);
+void             kvminithart(void);
+void             kvmmap(pagetable_t, uint64, uint64, uint64, int);
+int              mappages(pagetable_t, uint64, uint64, uint64, int);
+pagetable_t      uvmcreate(void);
+uint64           uvmalloc(pagetable_t, uint64, uint64, int);
+uint64           uvmdealloc(pagetable_t, uint64, uint64);
+int              uvmcopy(pagetable_t, pagetable_t, uint64);
+void             uvmfree(pagetable_t, uint64);
+void             uvmunmap(pagetable_t, uint64, uint64, int);
+void             uvmclear(pagetable_t, uint64);
+pte_t *          walk(pagetable_t, uint64, int, int *);
+uint64           walkaddr(pagetable_t, uint64);
+int              copyout(pagetable_t, uint64, char *, uint64);
+int              copyin(pagetable_t, char *, uint64, uint64);
+int              copyinstr(pagetable_t, char *, uint64, uint64);
+int              ismapped(pagetable_t, uint64);
+uint64           vmfault(pagetable_t, uint64, int);
+void             vmprint(pagetable_t);
 #ifdef LAB_PGTBL
-pte_t*          pgpte(pagetable_t, uint64);
+pte_t *          pgpte(pagetable_t, uint64);
 #endif
 
 // plic.c
-void            plicinit(void);
-void            plicinithart(void);
-int             plic_claim(void);
-void            plic_complete(int);
+void             plicinit(void);
+void             plicinithart(void);
+int              plic_claim(void);
+void             plic_complete(int);
 
 // virtio_disk.c
-void            virtio_disk_init(void);
-void            virtio_disk_rw(struct buf *, int);
-void            virtio_disk_intr(void);
+void             virtio_disk_init(void);
+void             virtio_disk_rw(struct buf *, int);
+void             virtio_disk_intr(void);
 
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
 
 
 
-#ifdef LAB_PGTBL
-// vmcopyin.c
-int             copyin_new(pagetable_t, char *, uint64, uint64);
-int             copyinstr_new(pagetable_t, char *, uint64, uint64);
-#endif
 
-#ifdef LAB_LOCK
-// stats.c
-void            statsinit(void);
-void            statsinc(void);
 
-// sprintf.c
-int             snprintf(char*, unsigned long, const char*, ...);
-#endif
 
-#ifdef KCSAN
-void            kcsaninit();
-#endif
 
-#ifdef LAB_NET
-// pci.c
-void            pci_init();
 
-// e1000.c
-void            e1000_init(uint32 *);
-void            e1000_intr(void);
-int             e1000_transmit(char *, int);
 
-// net.c
-void            netinit(void);
-void            net_rx(char *buf, int len);
 
-#endif
+
+
+
+
+
