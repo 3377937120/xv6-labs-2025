@@ -98,7 +98,14 @@ struct proc {
   // these are private to the process, so p->lock need not be held.
   uint64 kstack;               // Virtual address of kernel stack
   uint64 sz;                   // Size of process memory (bytes)
+  
   pagetable_t pagetable;       // User page table
+   int alarm_interval;          // 0 means disabled
+  int alarm_ticks;             // ticks since the previous alarm
+  uint64 alarm_handler;        // user virtual address of handler
+  int alarm_active;            // 1 while handler has not called sigreturn
+  struct trapframe alarm_tf;   // saved interrupted user register state
+
   struct trapframe *trapframe; // data page for trampoline.S
   struct context context;      // swtch() here to run process
   struct file *ofile[NOFILE];  // Open files

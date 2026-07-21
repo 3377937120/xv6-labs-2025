@@ -77,12 +77,30 @@ usertrap(void)
     setkilled(p);
   }
 
-  if(killed(p))
+   if(killed(p))
     kexit(-1);
 
-  // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
+  // which_dev == 2 means a timer interrupt.
+  if(which_dev == 2){
+    if(p->alarm_interval > 0 && p->alarm_active == 0){
+      p->alarm_ticks++;
+
+      if(p->alarm_ticks >= p->alarm_interval){
+        p->alarm_ticks = 0;
+        p->alarm_active = 1;
+
+        // Save the complete interrupted user context.
+        p->alarm_tf = *p->trapframe;
+
+        // prepare_return() will copy this value to sepc.
+        // sret will therefore enter the user alarm handler.
+        p->trapframe->epc = p->alarm_handler;
+      }
+    }
+
+    // Preserve xv6's original timer-preemption behavior.
     yield();
+  }
 
   prepare_return();
 

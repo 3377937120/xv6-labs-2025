@@ -69,6 +69,8 @@ sys_pause(void)
   uint ticks0;
 
   argint(0, &n);
+  backtrace();                 // 新增：bttest 调用 pause 时打印内核调用链
+
   if(n < 0)
     n = 0;
   acquire(&tickslock);
@@ -104,4 +106,45 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+uint64
+sys_sigalarm(void)
+{
+  int ticks;
+  uint64 handler;
+  struct proc *p = myproc();
+
+  argint(0, &ticks);
+  argaddr(1, &handler);
+
+  if(ticks < 0)
+    return -1;
+
+  p->alarm_interval = ticks;
+  p->alarm_handler = handler;
+  p->alarm_ticks = 0;
+
+  // sigalarm(0, 0) disables future alarms.
+  if(ticks == 0)
+    p->alarm_active = 0;
+
+  return 0;
+}
+
+uint64
+sys_sigreturn(void)
+{
+  struct proc *p = myproc();
+  uint64 saved_a0 = p->alarm_tf.a0;
+
+  // Restore epc and every user-visible register.
+  *p->trapframe = p->alarm_tf;
+
+  // The handler has finished; the next timer interval may be counted.
+  p->alarm_active = 0;
+
+  // syscall() will store this return value into trapframe->a0.
+  // Returning the interrupted a0 preserves the restored value.
+  return saved_a0;
 }

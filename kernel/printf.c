@@ -134,11 +134,44 @@ printf(char *fmt, ...)
 }
 
 void
+backtrace(void)
+{
+  uint64 fp;
+  uint64 stack_bottom;
+  uint64 stack_top;
+
+  printf("backtrace:\n");
+
+  fp = r_fp();
+  stack_bottom = PGROUNDDOWN(fp);
+  stack_top = stack_bottom + PGSIZE;
+
+  while(fp >= stack_bottom + 16 && fp < stack_top){
+    uint64 ra = *(uint64 *)(fp - 8);
+    uint64 prev_fp = *(uint64 *)(fp - 16);
+
+    if(ra == 0)
+      break;
+
+    printf("%p\n", (void *)ra);
+
+    // 栈向低地址增长；沿调用链向上时，调用者的 fp 应更大。
+    // 这两个检查同时防止损坏帧链导致死循环或越过栈页。
+    if(prev_fp <= fp || prev_fp >= stack_top)
+      break;
+
+    fp = prev_fp;
+  }
+}
+
+
+void
 panic(char *s)
 {
   panicking = 1;
   printf("panic: ");
   printf("%s\n", s);
+  backtrace();                 // 新增：冻结系统前打印内核调用链
   panicked = 1; // freeze uart output from other CPUs
   for(;;)
     ;
