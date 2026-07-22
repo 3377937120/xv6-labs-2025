@@ -23,10 +23,61 @@ struct {
   struct run *freelist;
 } kmem;
 
+#define NPHYPAGES ((PHYSTOP - KERNBASE) / PGSIZE)
+
+struct {
+  struct spinlock lock;
+  int count[NPHYPAGES];
+} krefs;
+
+static int
+paindex(uint64 pa)
+{
+  if(pa < KERNBASE || pa >= PHYSTOP || (pa % PGSIZE) != 0)
+    panic("paindex");
+  return (pa - KERNBASE) / PGSIZE;
+}
+
+static void
+krefset(void *pa, int value)
+{
+  int index = paindex((uint64)pa);
+
+  acquire(&krefs.lock);
+  krefs.count[index] = value;
+  release(&krefs.lock);
+}
+
+void
+krefinc(void *pa)
+{
+  int index = paindex((uint64)pa);
+
+  acquire(&krefs.lock);
+  if(krefs.count[index] < 1)
+    panic("krefinc");
+  krefs.count[index]++;
+  release(&krefs.lock);
+}
+
+int
+krefcnt(void *pa)
+{
+  int index = paindex((uint64)pa);
+  int value;
+
+  acquire(&krefs.lock);
+  value = krefs.count[index];
+  release(&krefs.lock);
+
+  return value;
+}
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  initlock(&krefs.lock, "krefs");
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -35,8 +86,10 @@ freerange(void *pa_start, void *pa_end)
 {
   char *p;
   p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE){
+    krefset(p, 1);
     kfree(p);
+  }
 }
 
 // Free the page of physical memory pointed at by pa,
@@ -47,11 +100,26 @@ void
 kfree(void *pa)
 {
   struct run *r;
+  int index;
+  int release_page = 0;
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
+  index = paindex((uint64)pa);
+
+  acquire(&krefs.lock);
+  if(krefs.count[index] < 1)
+    panic("kfree ref");
+  krefs.count[index]--;
+  if(krefs.count[index] == 0)
+    release_page = 1;
+  release(&krefs.lock);
+
+  if(release_page == 0)
+    return;
+
+  // Fill with junk only when no valid reference remains.
   memset(pa, 1, PGSIZE);
 
   r = (struct run*)pa;
@@ -76,7 +144,19 @@ kalloc(void)
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if(r)
+  if(r){
+    // A page removed from the freelist must have no references.
+    int index = paindex((uint64)r);
+
+    acquire(&krefs.lock);
+    if(krefs.count[index] != 0)
+      panic("kalloc ref");
+    krefs.count[index] = 1;
+    release(&krefs.lock);
+
     memset((char*)r, 5, PGSIZE); // fill with junk
+  }
+
   return (void*)r;
 }
+
