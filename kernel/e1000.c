@@ -104,7 +104,42 @@ e1000_transmit(char *buf, int len)
   // return -1 on failure (e.g., there is no descriptor available)
   // so that the caller knows to free buf.
   //
+  uint32 idx;
+  struct tx_desc *desc;
 
+  acquire(&e1000_lock);
+
+  // TDT points to the descriptor software should fill next.
+  idx = regs[E1000_TDT];
+  desc = &tx_ring[idx];
+
+  // DD == 0 means the NIC still owns this descriptor.
+  if((desc->status & E1000_TXD_STAT_DD) == 0){
+    release(&e1000_lock);
+    return -1;
+  }
+
+  // The previous transmission in this slot has completed.
+  // Reclaim the page that the driver kept alive for DMA.
+  if(desc->addr != 0){
+    kfree((void *)desc->addr);
+    desc->addr = 0;
+  }
+
+  // Fill a legacy transmit descriptor for one complete Ethernet frame.
+  desc->addr = (uint64)buf;
+  desc->length = len;
+  desc->cso = 0;
+  desc->cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS;
+  desc->status = 0;
+  desc->css = 0;
+  desc->special = 0;
+
+  // Make descriptor writes visible before notifying the NIC with TDT.
+  __sync_synchronize();
+  regs[E1000_TDT] = (idx + 1) % TX_RING_SIZE;
+
+  release(&e1000_lock);
   
   return 0;
 }
@@ -118,6 +153,61 @@ e1000_recv(void)
   // Check for packets that have arrived from the e1000
   // Create and deliver a buf for each packet (using net_rx()).
   //
+   for(;;){
+    uint32 idx;
+    struct rx_desc *desc;
+    char *packet;
+    char *fresh;
+    int len;
+
+    acquire(&e1000_lock);
+
+    // RDT is the last descriptor returned by software.
+    // The next completed packet, if any, is RDT + 1 modulo the ring size.
+    idx = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+    desc = &rx_ring[idx];
+
+    if((desc->status & E1000_RXD_STAT_DD) == 0){
+      release(&e1000_lock);
+      return;
+    }
+
+    packet = (char *)desc->addr;
+    len = desc->length;
+
+    // Replenish the ring before handing the old page to net_rx().
+    fresh = kalloc();
+    if(fresh == 0){
+      // Under memory pressure, drop this packet and reuse the same page.
+      // This keeps the RX ring usable without handing freed memory to DMA.
+      desc->length = 0;
+      desc->csum = 0;
+      desc->status = 0;
+      desc->errors = 0;
+      desc->special = 0;
+      __sync_synchronize();
+      regs[E1000_RDT] = idx;
+      release(&e1000_lock);
+      continue;
+    }
+
+    desc->addr = (uint64)fresh;
+    desc->length = 0;
+    desc->csum = 0;
+    desc->status = 0;
+    desc->errors = 0;
+    desc->special = 0;
+
+    __sync_synchronize();
+    regs[E1000_RDT] = idx;
+
+    // net_rx() may transmit an ARP reply and acquire e1000_lock.
+    // Therefore the driver lock must be released first.
+    release(&e1000_lock);
+
+    // Ownership of packet transfers to the network stack.
+    net_rx(packet, len);
+  }
 
 }
 
