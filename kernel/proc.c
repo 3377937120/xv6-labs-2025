@@ -124,6 +124,8 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  // 新进程最初没有 mmap 区域。
+  memset(p->vmas, 0, sizeof(p->vmas));
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -169,6 +171,7 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  memset(p->vmas, 0, sizeof(p->vmas));
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -273,6 +276,16 @@ kfork(void)
   }
   np->sz = p->sz;
 
+  // 子进程继承父进程的 VMA 元数据。
+  // uvmcopy() 只复制 [0, p->sz) 的普通用户内存，
+  // mmap 高地址物理页由子进程以后再次 fault 装入。
+  for(i = 0; i < NVMA; i++){
+    if(p->vmas[i].used){
+      np->vmas[i] = p->vmas[i];
+      np->vmas[i].file = filedup(p->vmas[i].file);
+    }
+  }
+
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
 
@@ -327,6 +340,10 @@ kexit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  // 先按 munmap 语义写回并删除所有映射。
+  // VMA 持有独立 file 引用，因此应在关闭 fd 之前清理。
+  vma_unmap_all(p);
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){

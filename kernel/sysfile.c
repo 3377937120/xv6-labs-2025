@@ -15,6 +15,7 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "memlayout.h"
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -502,4 +503,122 @@ sys_pipe(void)
     return -1;
   }
   return 0;
+}
+
+// 在当前进程的 mmap 区域中寻找一段不与已有 VMA 重叠的空间。
+// 返回页对齐地址；没有空间时返回 0。
+static uint64
+mmap_find_addr(struct proc *p, uint64 maplen)
+{
+  uint64 candidate = MMAPBASE;
+
+  // 避免与异常大的 heap 重叠。
+  if(candidate < PGROUNDUP(p->sz))
+    candidate = PGROUNDUP(p->sz);
+
+  for(;;){
+    int moved = 0;
+
+    // 检查溢出和高地址保留区。
+    if(candidate + maplen < candidate ||
+       candidate + maplen > TRAPFRAME)
+      return 0;
+
+    for(int i = 0; i < NVMA; i++){
+      struct vma *v = &p->vmas[i];
+      if(!v->used)
+        continue;
+
+      uint64 vend = v->addr + v->maplen;
+
+      // 两个半开区间 [candidate,candidate+maplen)
+      // 与 [v->addr,vend) 发生重叠。
+      if(candidate < vend &&
+         candidate + maplen > v->addr){
+        candidate = PGROUNDUP(vend);
+        moved = 1;
+        break;
+      }
+    }
+
+    if(!moved)
+      return candidate;
+  }
+}
+
+uint64
+sys_mmap(void)
+{
+  uint64 hint;
+  int len, prot, flags, offset;
+  struct file *f;
+  struct proc *p = myproc();
+
+  argaddr(0, &hint);
+  argint(1, &len);
+  argint(2, &prot);
+  argint(3, &flags);
+  if(argfd(4, 0, &f) < 0)
+    return (uint64)-1;
+  argint(5, &offset);
+
+  // 本实验只要求 addr=0、offset=0。
+  if(hint != 0 || len <= 0 || offset != 0)
+    return (uint64)-1;
+
+  // 只接受题目规定的权限组合。
+  if((prot & ~(PROT_READ | PROT_WRITE)) != 0 ||
+     (prot & (PROT_READ | PROT_WRITE)) == 0)
+    return (uint64)-1;
+
+  // flags 必须恰好是 MAP_SHARED 或 MAP_PRIVATE。
+  if(flags != MAP_SHARED && flags != MAP_PRIVATE)
+    return (uint64)-1;
+
+  // 只映射可读取的普通 inode 文件。
+  if(f->type != FD_INODE || f->readable == 0)
+    return (uint64)-1;
+
+  // 共享可写映射最终要写回，因此 fd 必须可写。
+  // 私有可写映射不写回，可使用只读打开的文件。
+  if((prot & PROT_WRITE) &&
+     flags == MAP_SHARED &&
+     f->writable == 0)
+    return (uint64)-1;
+
+  int slot = -1;
+  for(int i = 0; i < NVMA; i++){
+    if(!p->vmas[i].used){
+      slot = i;
+      break;
+    }
+  }
+  if(slot < 0)
+    return (uint64)-1;
+
+  uint64 maplen = PGROUNDUP((uint64)len);
+  if(maplen == 0 || maplen < (uint64)len)
+    return (uint64)-1;
+
+  uint64 addr = mmap_find_addr(p, maplen);
+  if(addr == 0)
+    return (uint64)-1;
+
+  // VMA 独立持有一个 file 引用。
+  // 即使用户随后 close(fd)，映射仍然有效。
+  filedup(f);
+
+  struct vma *v = &p->vmas[slot];
+  memset(v, 0, sizeof(*v));
+  v->used = 1;
+  v->addr = addr;
+  v->len = (uint64)len;
+  v->maplen = maplen;
+  v->prot = prot;
+  v->flags = flags;
+  v->offset = 0;
+  v->file = f;
+
+  // 此时没有分配物理页，也没有读取文件。
+  return addr;
 }

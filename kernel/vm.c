@@ -7,6 +7,14 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
+#include "fcntl.h"
+
+static struct vma *vma_find(struct proc *p, uint64 va);
+static uint64 mmap_fault(pagetable_t pagetable,
+                         uint64 va,
+                         int read);
 
 /*
  * the kernel's page table.
@@ -211,6 +219,21 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
   }
 }
 
+uint64
+sys_munmap(void)
+{
+  uint64 addr;
+  int len;
+
+  argaddr(0, &addr);
+  argint(1, &len);
+
+  if(len <= 0)
+    return -1;
+
+  return vma_unmap(myproc(), addr, (uint64)len);
+}
+
 // Allocate PTEs and physical memory to grow a process from oldsz to
 // newsz, which need not be page aligned.  Returns new size or 0 on error.
 uint64
@@ -386,7 +409,7 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
     va0 = PGROUNDDOWN(srcva);
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
+      if((pa0 = vmfault(pagetable, va0, 1)) == 0) {
         return -1;
       }
     }
@@ -415,8 +438,10 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   while(got_null == 0 && max > 0){
     va0 = PGROUNDDOWN(srcva);
     pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
+    if(pa0 == 0){
+      if((pa0 = vmfault(pagetable, va0, 1)) == 0)
+        return -1;
+    }
     n = PGSIZE - (srcva - va0);
     if(n > max)
       n = max;
@@ -445,6 +470,90 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   }
 }
 
+// 查找包含虚拟地址 va 的 VMA。
+static struct vma *
+vma_find(struct proc *p, uint64 va)
+{
+  for(int i = 0; i < NVMA; i++){
+    struct vma *v = &p->vmas[i];
+
+    if(v->used &&
+       va >= v->addr &&
+       va < v->addr + v->maplen)
+      return v;
+  }
+
+  return 0;
+}
+
+// 处理 mmap 区域中的一次 load/store page fault。
+// 成功返回映射后的物理页地址，失败返回 0。
+static uint64
+mmap_fault(pagetable_t pagetable, uint64 va, int read)
+{
+  struct proc *p = myproc();
+  struct vma *v = vma_find(p, va);
+
+  if(v == 0)
+    return 0;
+
+  // load fault 需要 PROT_READ。
+  if(read && (v->prot & PROT_READ) == 0)
+    return 0;
+
+  // store fault 需要 PROT_WRITE。
+  if(!read && (v->prot & PROT_WRITE) == 0)
+    return 0;
+
+  uint64 pageva = PGROUNDDOWN(va);
+
+  // 已存在映射却仍发生权限 fault，不能再次装页。
+  if(ismapped(pagetable, pageva))
+    return 0;
+
+  char *mem = kalloc();
+  if(mem == 0)
+    return 0;
+
+  // 文件短于映射区或最后一页不完整时，其余字节为零。
+  memset(mem, 0, PGSIZE);
+
+  uint64 delta = pageva - v->addr;
+  if(delta < v->len){
+    uint64 n = v->len - delta;
+    if(n > PGSIZE)
+      n = PGSIZE;
+
+    ilock(v->file->ip);
+    int r = readi(v->file->ip, 0, (uint64)mem,
+                  v->offset + delta, (uint)n);
+    iunlock(v->file->ip);
+
+    if(r < 0){
+      kfree(mem);
+      return 0;
+    }
+  }
+
+  int perm = PTE_U;
+
+  if(v->prot & PROT_READ)
+    perm |= PTE_R;
+
+  if(v->prot & PROT_WRITE){
+    // RISC-V 的可写叶 PTE 同时需要 R 位。
+    perm |= PTE_R | PTE_W;
+  }
+
+  if(mappages(pagetable, pageva, PGSIZE,
+              (uint64)mem, perm) != 0){
+    kfree(mem);
+    return 0;
+  }
+
+  return (uint64)mem;
+}
+
 // allocate and map user memory if process is referencing a page
 // that was lazily allocated in sys_sbrk().
 // returns 0 if va is invalid or already mapped, or if
@@ -455,17 +564,27 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   uint64 mem;
   struct proc *p = myproc();
 
-  if (va >= p->sz)
-    return 0;
   va = PGROUNDDOWN(va);
-  if(ismapped(pagetable, va)) {
+
+  // mmap 地址通常高于 p->sz，因此必须先查 VMA。
+  if(vma_find(p, va) != 0)
+    return mmap_fault(pagetable, va, read);
+
+  // 下面保留 2025 starter 的 lazy sbrk 语义。
+  if(va >= p->sz)
     return 0;
-  }
-  mem = (uint64) kalloc();
+
+  if(ismapped(pagetable, va))
+    return 0;
+
+  mem = (uint64)kalloc();
   if(mem == 0)
     return 0;
-  memset((void *) mem, 0, PGSIZE);
-  if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
+
+  memset((void *)mem, 0, PGSIZE);
+
+  if(mappages(pagetable, va, PGSIZE, mem,
+              PTE_W | PTE_U | PTE_R) != 0){
     kfree((void *)mem);
     return 0;
   }
@@ -483,4 +602,238 @@ ismapped(pagetable_t pagetable, uint64 va)
     return 1;
   }
   return 0;
+}
+
+// 把指定 VMA 区间内已经装入的 MAP_SHARED 页面写回文件。
+// addr 和 len 表示本次即将解除映射的页对齐区间。
+static int
+vma_writeback(struct proc *p, struct vma *v,
+              uint64 addr, uint64 len)
+{
+   // MAP_PRIVATE 不写回文件。
+  // 没有写权限的共享映射也不需要写回修改。
+  if(v->flags != MAP_SHARED ||
+     (v->prot & PROT_WRITE) == 0)
+    return 0;
+
+  uint64 unmap_end = addr + len;
+
+  // 用户真正请求映射的数据结束位置。
+  // 最后一页可能只有一部分对应有效文件内容。
+  uint64 data_end = v->addr + v->len;
+
+  if(unmap_end > data_end)
+    unmap_end = data_end;
+
+  if(unmap_end <= addr)
+    return 0;
+
+  /*
+   * 与 kernel/file.c:filewrite() 使用相同的事务大小。
+   * 不能把一整页或更大的区域放进单个日志事务。
+   */
+  int max =
+    ((MAXOPBLOCKS - 1 - 1 - 2) / 2) * BSIZE;
+
+  /*
+   * addr 正常情况下由 munmap 传入页对齐地址。
+   * 这里仍使用 PGROUNDDOWN，使函数更加稳健。
+   */
+  uint64 first_page = PGROUNDDOWN(addr);
+  uint64 last_page = PGROUNDUP(unmap_end);
+
+  for(uint64 pageva = first_page;
+      pageva < last_page;
+      pageva += PGSIZE){
+
+    pte_t *pte = walk(p->pagetable, pageva, 0);
+
+    /*
+     * mmap 使用惰性装页。
+     * 用户没有访问过的页面没有 PTE，无需写回。
+     */
+    if(pte == 0 ||
+       (*pte & PTE_V) == 0 ||
+       (*pte & PTE_U) == 0)
+      continue;
+
+    /*
+     * 计算当前物理页中真正需要写回的部分。
+     */
+    uint64 start = pageva;
+    uint64 stop = pageva + PGSIZE;
+
+    if(start < addr)
+      start = addr;
+
+    if(stop > unmap_end)
+      stop = unmap_end;
+
+    if(stop <= start)
+      continue;
+
+    /*
+     * PTE2PA 得到物理页首地址。
+     * xv6 内核对物理内存采用直接映射，因此可作为
+     * writei(user_src=0) 的内核源地址使用。
+     */
+    uint64 pa =
+      PTE2PA(*pte) + (start - pageva);
+
+    /*
+     * 文件偏移必须根据 VMA 的原始映射关系计算：
+     *
+     * 文件偏移 =
+     *   VMA 文件起始 offset +
+     *   当前虚拟地址相对于 VMA addr 的偏移。
+     */
+    uint64 fileoff =
+      v->offset + (start - v->addr);
+
+    uint64 left = stop - start;
+
+    /*
+     * 一页也可能需要多个日志事务才能完整写回。
+     */
+    while(left > 0){
+      int n;
+
+      if(left > (uint64)max)
+        n = max;
+      else
+        n = (int)left;
+
+      begin_op();
+
+      ilock(v->file->ip);
+
+      int written =
+        writei(v->file->ip,
+               0,          // 源地址位于内核内存
+               pa,
+               fileoff,
+               n);
+
+      iunlock(v->file->ip);
+
+      end_op();
+
+      if(written != n)
+        return -1;
+
+      /*
+       * 三个值都必须推进。
+       * 漏掉任意一个，后续分段就会覆盖或重复写入。
+       */
+      pa += n;
+      fileoff += n;
+      left -= n;
+    }
+  }
+
+  return 0;
+}
+
+// 删除一个 VMA 的开头、末尾或全部区域。
+// 返回 0 表示成功，-1 表示参数或写回错误。
+int
+vma_unmap(struct proc *p, uint64 addr, uint64 len)
+{
+  if(len == 0 || addr % PGSIZE != 0)
+    return -1;
+
+  uint64 maplen = PGROUNDUP(len);
+
+  if(maplen == 0 ||
+     addr + maplen < addr)
+    return -1;
+
+  struct vma *v = 0;
+
+  for(int i = 0; i < NVMA; i++){
+    struct vma *cur = &p->vmas[i];
+
+    if(!cur->used)
+      continue;
+
+    uint64 vend =
+      cur->addr + cur->maplen;
+
+    /*
+     * 只允许删除整个 VMA、VMA 开头或 VMA 末尾。
+     */
+    if(addr >= cur->addr &&
+       addr + maplen <= vend &&
+       (addr == cur->addr ||
+        addr + maplen == vend)){
+      v = cur;
+      break;
+    }
+  }
+
+  if(v == 0)
+    return -1;
+
+  /*
+   * 必须在改变 v->addr、v->offset、v->len 之前写回。
+   */
+  int result =
+    vma_writeback(p, v, addr, maplen);
+
+  /*
+   * 随后才解除 PTE 并释放已经装入的物理页。
+   */
+  uvmunmap(p->pagetable,
+           addr,
+           maplen / PGSIZE,
+           1);
+
+  uint64 old_addr = v->addr;
+  uint64 old_len = v->len;
+  uint64 old_maplen = v->maplen;
+
+  // 删除整个 VMA。
+  if(addr == old_addr &&
+     maplen == old_maplen){
+
+    struct file *f = v->file;
+
+    memset(v, 0, sizeof(*v));
+    fileclose(f);
+
+    return result;
+  }
+
+  // 删除 VMA 开头。
+  if(addr == old_addr){
+    v->addr += maplen;
+    v->offset += maplen;
+    v->maplen -= maplen;
+
+    if(old_len > maplen)
+      v->len = old_len - maplen;
+    else
+      v->len = 0;
+
+    return result;
+  }
+
+  // 删除 VMA 末尾。
+  v->maplen -= maplen;
+
+  if(v->len > v->maplen)
+    v->len = v->maplen;
+
+  return result;
+}
+
+// 像逐个调用 munmap() 一样清理全部 VMA。
+void
+vma_unmap_all(struct proc *p)
+{
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].used)
+      vma_unmap(p, p->vmas[i].addr,
+                p->vmas[i].maplen);
+  }
 }

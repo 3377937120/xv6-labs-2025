@@ -57,3 +57,7 @@
 //   TRAPFRAME (p->trapframe, used by the trampoline)
 //   TRAMPOLINE (the same page as in the kernel)
 #define TRAPFRAME (TRAMPOLINE - PGSIZE)
+
+// mmaptest 的示例地址从 0xC0000000 开始。
+// 该区域远离普通 heap，并低于 TRAPFRAME/TRAMPOLINE。
+#define MMAPBASE 0xC0000000L
