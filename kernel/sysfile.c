@@ -301,6 +301,40 @@ create(char *path, short type, short major, short minor)
   return 0;
 }
 
+// ip must be locked on entry.
+// Return a locked non-symlink inode, or 0 on failure.
+// This helper must be called inside a file-system transaction.
+static struct inode *
+follow_symlink(struct inode *ip)
+{
+  char target[MAXPATH];
+
+  for(int depth = 0; ip->type == T_SYMLINK; depth++){
+    if(depth >= 10){
+      iunlockput(ip);
+      return 0;
+    }
+
+    if(ip->size < 1 || ip->size > MAXPATH ||
+       readi(ip, 0, (uint64)target, 0, ip->size) != ip->size){
+      iunlockput(ip);
+      return 0;
+    }
+
+    // Protect namei() from a malformed on-disk link that lacks NUL.
+    target[MAXPATH - 1] = '\0';
+
+    iunlockput(ip);
+
+    if((ip = namei(target)) == 0)
+      return 0;
+
+    ilock(ip);
+  }
+
+  return ip;
+}
+
 uint64
 sys_open(void)
 {
@@ -328,14 +362,24 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
-    if(ip->type == T_DIR && omode != O_RDONLY){
-      iunlockput(ip);
+  }
+
+  // create() and the normal lookup path both leave ip locked here.
+  if(ip->type == T_SYMLINK && (omode & O_NOFOLLOW) == 0){
+    if((ip = follow_symlink(ip)) == 0){
       end_op();
       return -1;
     }
   }
 
-  if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
+  if(ip->type == T_DIR && omode != O_RDONLY){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  if(ip->type == T_DEVICE &&
+     (ip->major < 0 || ip->major >= NDEV)){
     iunlockput(ip);
     end_op();
     return -1;
@@ -356,18 +400,53 @@ sys_open(void)
     f->type = FD_INODE;
     f->off = 0;
   }
+
   f->ip = ip;
   f->readable = !(omode & O_WRONLY);
   f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
 
-  if((omode & O_TRUNC) && ip->type == T_FILE){
+  if((omode & O_TRUNC) && ip->type == T_FILE)
     itrunc(ip);
-  }
 
   iunlock(ip);
   end_op();
 
   return fd;
+}
+
+// int symlink(char *target, char *path)
+// Create a symbolic-link inode at path and store target inside it.
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH];
+  char path[MAXPATH];
+  struct inode *ip;
+  int target_len;
+
+  target_len = argstr(0, target, MAXPATH);
+  if(target_len < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+
+  begin_op();
+
+  // create() returns a locked inode on success.
+  if((ip = create(path, T_SYMLINK, 0, 0)) == 0){
+    end_op();
+    return -1;
+  }
+
+  // argstr() returns the length including the terminating '\0'.
+  // Store the NUL as part of the inode data so open() can read a string.
+  if(writei(ip, 0, (uint64)target, 0, target_len) != target_len){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  iunlockput(ip);
+  end_op();
+  return 0;
 }
 
 uint64
