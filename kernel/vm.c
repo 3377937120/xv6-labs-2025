@@ -610,35 +610,40 @@ static int
 vma_writeback(struct proc *p, struct vma *v,
               uint64 addr, uint64 len)
 {
-   // MAP_PRIVATE 不写回文件。
-  // 没有写权限的共享映射也不需要写回修改。
+  // MAP_PRIVATE 不写回；只读映射也不可能产生合法修改。
   if(v->flags != MAP_SHARED ||
      (v->prot & PROT_WRITE) == 0)
     return 0;
 
   uint64 unmap_end = addr + len;
 
-  // 用户真正请求映射的数据结束位置。
-  // 最后一页可能只有一部分对应有效文件内容。
-  uint64 data_end = v->addr + v->len;
+  /*
+   * v->len 是 mmap 请求长度，并不等于实际文件长度。
+   * 写回上界必须受 inode.size 限制，不能把 EOF 后的零填充
+   * 写回并扩展文件。
+   */
+  uint64 file_size;
+  ilock(v->file->ip);
+  file_size = v->file->ip->size;
+  iunlock(v->file->ip);
 
+  uint64 file_backed_len = 0;
+  if(file_size > v->offset)
+    file_backed_len = file_size - v->offset;
+  if(file_backed_len > v->len)
+    file_backed_len = v->len;
+
+  uint64 data_end = v->addr + file_backed_len;
   if(unmap_end > data_end)
     unmap_end = data_end;
 
   if(unmap_end <= addr)
     return 0;
 
-  /*
-   * 与 kernel/file.c:filewrite() 使用相同的事务大小。
-   * 不能把一整页或更大的区域放进单个日志事务。
-   */
+  // 与 filewrite() 相同，分段执行日志事务。
   int max =
     ((MAXOPBLOCKS - 1 - 1 - 2) / 2) * BSIZE;
 
-  /*
-   * addr 正常情况下由 munmap 传入页对齐地址。
-   * 这里仍使用 PGROUNDDOWN，使函数更加稳健。
-   */
   uint64 first_page = PGROUNDDOWN(addr);
   uint64 last_page = PGROUNDUP(unmap_end);
 
@@ -648,83 +653,44 @@ vma_writeback(struct proc *p, struct vma *v,
 
     pte_t *pte = walk(p->pagetable, pageva, 0);
 
-    /*
-     * mmap 使用惰性装页。
-     * 用户没有访问过的页面没有 PTE，无需写回。
-     */
+    // 未访问过的惰性页面没有有效 PTE，不需要写回。
     if(pte == 0 ||
        (*pte & PTE_V) == 0 ||
        (*pte & PTE_U) == 0)
       continue;
 
-    /*
-     * 计算当前物理页中真正需要写回的部分。
-     */
     uint64 start = pageva;
     uint64 stop = pageva + PGSIZE;
 
     if(start < addr)
       start = addr;
-
     if(stop > unmap_end)
       stop = unmap_end;
-
     if(stop <= start)
       continue;
 
-    /*
-     * PTE2PA 得到物理页首地址。
-     * xv6 内核对物理内存采用直接映射，因此可作为
-     * writei(user_src=0) 的内核源地址使用。
-     */
     uint64 pa =
       PTE2PA(*pte) + (start - pageva);
-
-    /*
-     * 文件偏移必须根据 VMA 的原始映射关系计算：
-     *
-     * 文件偏移 =
-     *   VMA 文件起始 offset +
-     *   当前虚拟地址相对于 VMA addr 的偏移。
-     */
     uint64 fileoff =
       v->offset + (start - v->addr);
-
     uint64 left = stop - start;
 
-    /*
-     * 一页也可能需要多个日志事务才能完整写回。
-     */
     while(left > 0){
-      int n;
-
-      if(left > (uint64)max)
-        n = max;
-      else
-        n = (int)left;
+      int n = left > (uint64)max ? max : (int)left;
 
       begin_op();
-
       ilock(v->file->ip);
-
-      int written =
-        writei(v->file->ip,
-               0,          // 源地址位于内核内存
-               pa,
-               fileoff,
-               n);
-
+      int written = writei(v->file->ip,
+                           0,       // 源地址位于内核内存
+                           pa,
+                           fileoff,
+                           n);
       iunlock(v->file->ip);
-
       end_op();
 
       if(written != n)
         return -1;
 
-      /*
-       * 三个值都必须推进。
-       * 漏掉任意一个，后续分段就会覆盖或重复写入。
-       */
       pa += n;
       fileoff += n;
       left -= n;
