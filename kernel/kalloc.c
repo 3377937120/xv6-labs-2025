@@ -1,6 +1,6 @@
 // Physical memory allocator, for user processes,
-// kernel stacks, page-table pages,
-// and pipe buffers. Allocates whole 4096-byte pages.
+// kernel stacks, page-table pages, and pipe buffers.
+// Allocates whole 4096-byte pages.
 
 #include "types.h"
 #include "param.h"
@@ -11,59 +11,66 @@
 
 void freerange(void *pa_start, void *pa_end);
 
-extern char end[]; // first address after kernel.
-                   // defined by kernel.ld.
+extern char end[];  // 内核结束后的第一个地址，由 kernel.ld 定义
 
+// 空闲页本身被当作链表节点使用。
 struct run {
   struct run *next;
 };
 
+// 每个 CPU 都拥有一把独立的锁和一条独立的空闲页链表。
 struct {
   struct spinlock lock;
   struct run *freelist;
 } kmem[NCPU];
 
-#define STEAL_BATCH 256
-
+// 初始化每 CPU 内存分配器。
 void
-kinit()
+kinit(void)
 {
+  // 所有锁名必须以 "kmem" 开头，kalloctest 才会统计它们。
+  // 使用字符串常量可避免局部字符数组生命周期结束的问题。
   for(int i = 0; i < NCPU; i++)
     initlock(&kmem[i].lock, "kmem");
 
-  freerange(end, (void*)PHYSTOP);
+  // 启动阶段只有一个 CPU 执行这里。
+  // freerange() 会通过 kfree() 把所有空闲页放到该 CPU 的链表。
+  freerange(end, (void *)PHYSTOP);
 }
 
-
+// 将 [pa_start, pa_end) 中的每个完整页面交给 kfree()。
 void
 freerange(void *pa_start, void *pa_end)
 {
   char *p;
-  p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+
+  p = (char *)PGROUNDUP((uint64)pa_start);
+  for(; p + PGSIZE <= (char *)pa_end; p += PGSIZE)
     kfree(p);
 }
 
-// Free the page of physical memory pointed at by pa,
-// which normally should have been returned by a
-// call to kalloc().  (The exception is when
-// initializing the allocator; see kinit above.)
+// 释放 pa 指向的物理页。
 void
 kfree(void *pa)
 {
   struct run *r;
+  int id;
 
-  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+  if(((uint64)pa % PGSIZE) != 0 ||
+     (char *)pa < end ||
+     (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
+  // 填充整页是较慢操作，必须放在 kmem 锁外。
   memset(pa, 1, PGSIZE);
+  r = (struct run *)pa;
 
-  r = (struct run*)pa;
-
+  // cpuid() 及其返回值只可在关闭中断期间安全使用。
   push_off();
-  int id = cpuid();
+  id = cpuid();
 
+  // 常见释放路径只访问当前 CPU 的本地链表。
+  // 临界区只有两个指针操作，持锁时间非常短。
   acquire(&kmem[id].lock);
   r->next = kmem[id].freelist;
   kmem[id].freelist = r;
@@ -72,76 +79,35 @@ kfree(void *pa)
   pop_off();
 }
 
-// Try to obtain one page for CPU id by taking a small batch from
-// another CPU. No two kmem locks are held at the same time.
+// 当前 CPU 的链表为空时，从其他 CPU 偷取一页。
+// 重点不是减少 acquire() 次数，而是让每次远程持锁时间保持 O(1)。
 static struct run *
-steal(int id)
+steal_one_page(int id)
 {
   for(int step = 1; step < NCPU; step++){
-    int donor = (id + step) % NCPU;
-    struct run *batch;
-    struct run *tail;
+    int victim = (id + step) % NCPU;
     struct run *r;
-    struct run *rest;
 
-    /*
-     * 此时不持有本地 kmem[id].lock。
-     * 每次只获取一把 donor 锁，避免锁顺序死锁。
-     */
-    acquire(&kmem[donor].lock);
+    // 此时不持有 kmem[id].lock，因此不会形成双锁环路。
+    acquire(&kmem[victim].lock);
 
-    batch = kmem[donor].freelist;
-    if(batch == 0){
-      release(&kmem[donor].lock);
-      continue;
+    r = kmem[victim].freelist;
+    if(r != 0)
+      kmem[victim].freelist = r->next;
+
+    release(&kmem[victim].lock);
+
+    if(r != 0){
+      r->next = 0;
+      return r;
     }
-
-    /*
-     * 从 donor 链表头部拆下最多 STEAL_BATCH 页。
-     */
-    tail = batch;
-    int n = 1;
-
-    while(n < STEAL_BATCH && tail->next != 0){
-      tail = tail->next;
-      n++;
-    }
-
-    kmem[donor].freelist = tail->next;
-    tail->next = 0;
-
-    release(&kmem[donor].lock);
-
-    /*
-     * 第一页直接返回给本次 kalloc。
-     * 剩余页面放入当前 CPU 的本地 freelist。
-     */
-    r = batch;
-    rest = r->next;
-    r->next = 0;
-
-    if(rest != 0){
-      acquire(&kmem[id].lock);
-
-      /*
-       * tail 是当前批次最后一个节点。
-       * 将剩余批次接到本地链表前面。
-       */
-      tail->next = kmem[id].freelist;
-      kmem[id].freelist = rest;
-
-      release(&kmem[id].lock);
-    }
-
-    return r;
   }
 
+  // 所有 CPU 的链表都为空。
   return 0;
 }
 
-// Allocate one 4096-byte page of physical memory.
-// Returns a pointer that the kernel can use.
-// Returns 0 if the memory cannot be allocated.
+// 分配一个 4096 字节物理页。
 void *
 kalloc(void)
 {
@@ -151,20 +117,22 @@ kalloc(void)
   push_off();
   id = cpuid();
 
+  // 快速路径：只从当前 CPU 的 freelist 取一页。
   acquire(&kmem[id].lock);
   r = kmem[id].freelist;
-
   if(r != 0)
     kmem[id].freelist = r->next;
   release(&kmem[id].lock);
 
- if(r == 0)
-    r = steal(id);
+  // 仅在本地链表为空时访问其他 CPU。
+  if(r == 0)
+    r = steal_one_page(id);
 
   pop_off();
 
+  // 页面填充同样必须放在所有 kmem 锁之外。
   if(r != 0)
-    memset((char*)r, 5, PGSIZE);
+    memset((char *)r, 5, PGSIZE);
 
-  return (void*)r;
+  return (void *)r;
 }
